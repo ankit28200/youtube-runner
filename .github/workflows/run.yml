@@ -1,0 +1,118 @@
+name: Autonomous Affiliate Cloud Engine
+
+on:
+  schedule:
+    - cron: '25 */2 * * *'   # Every 2 hours (exact same timeline)
+
+  workflow_dispatch:
+    inputs:
+      amazon_url:
+        description: 'Custom Amazon product URL (leave empty to auto-pick from queue)'
+        required: false
+        default: ''
+      batch_size:
+        description: 'Number of videos to produce and upload'
+        required: false
+        default: '1'
+      language:
+        description: 'Language: en / hi'
+        required: false
+        default: 'en'
+      dry_run:
+        description: 'true = generate everything but skip YouTube upload'
+        required: false
+        default: 'false'
+
+concurrency:
+  group: affiliate-uploader
+  cancel-in-progress: false
+
+jobs:
+  run-engine:
+    name: Execute Autonomous Engine
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      # ── 1. Securely checkout private codebase using Personal Access Token ───
+      - name: Checkout private codebase
+        uses: actions/checkout@v4
+        with:
+          repository: ankit28200/youtube
+          token: ${{ secrets.GH_PAT }}
+          fetch-depth: 0
+
+      # ── 2. Python Setup ─────────────────────────────────────────────────────
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: 'affiliate/requirements.txt'
+
+      # ── 3. Install System Dependencies (FFmpeg) ─────────────────────────────
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg fonts-liberation
+          ffmpeg -version | head -1
+
+      # ── 4. Install Python Dependencies ──────────────────────────────────────
+      - name: Install Python dependencies
+        run: |
+          pip install --quiet --upgrade pip
+          pip install --quiet -r affiliate/requirements.txt
+
+      # ── 5. Run Autonomous Engine ────────────────────────────────────────────
+      - name: Run 24/7 Autonomous Affiliate Engine
+        id: pipeline
+        working-directory: affiliate
+        env:
+          GEMINI_API_KEY:              ${{ secrets.GEMINI_API_KEY }}
+          CLIENT_ID:                   ${{ secrets.CLIENT_ID || secrets.GOOGLE_CLIENT_ID }}
+          CLIENT_SECRET:               ${{ secrets.CLIENT_SECRET || secrets.GOOGLE_CLIENT_SECRET }}
+          REFRESH_TOKEN:               ${{ secrets.REFRESH_TOKEN || secrets.GOOGLE_REFRESH_TOKEN || secrets.YOUTUBE_REFRESH_TOKEN }}
+          PLAYLIST_ID:                 ${{ secrets.PLAYLIST_ID }}
+          AMAZON_COOKIE:               ${{ secrets.AMAZON_COOKIE }}
+          FB_PAGE_ACCESS_TOKEN:        ${{ secrets.FB_PAGE_ACCESS_TOKEN }}
+          FB_PAGE_ID:                  ${{ secrets.FB_PAGE_ID }}
+          BUFFER_ACCESS_TOKEN:         ${{ secrets.BUFFER_ACCESS_TOKEN }}
+          BUFFER_TIKTOK_PROFILE_ID:    ${{ secrets.BUFFER_TIKTOK_PROFILE_ID }}
+          TIKTOK_ACCESS_TOKEN:         ${{ secrets.TIKTOK_ACCESS_TOKEN }}
+          TIKTOK_REFRESH_TOKEN:        ${{ secrets.TIKTOK_REFRESH_TOKEN }}
+          TIKTOK_CLIENT_KEY:           ${{ secrets.TIKTOK_CLIENT_KEY || 'sbawjt91ovb0g2rw7s' }}
+          TIKTOK_CLIENT_SECRET:        ${{ secrets.TIKTOK_CLIENT_SECRET || 'mq55NiojmFkbtpHCCHU2j9KBWBmSz2n6' }}
+          TWITTER_AUTH_TOKEN:          ${{ secrets.TWITTER_AUTH_TOKEN }}
+          TWITTER_CT0:                 ${{ secrets.TWITTER_CT0 }}
+          TWITTER_API_KEY:             ${{ secrets.TWITTER_API_KEY || secrets.X_API_KEY }}
+          TWITTER_API_SECRET:          ${{ secrets.TWITTER_API_SECRET || secrets.X_API_SECRET }}
+          TWITTER_ACCESS_TOKEN:        ${{ secrets.TWITTER_ACCESS_TOKEN || secrets.X_ACCESS_TOKEN }}
+          TWITTER_ACCESS_TOKEN_SECRET: ${{ secrets.TWITTER_ACCESS_TOKEN_SECRET || secrets.X_ACCESS_TOKEN_SECRET }}
+          PRIVACY_STATUS:              ${{ inputs.privacy || 'public' }}
+          DRY_RUN:                     ${{ inputs.dry_run || 'false' }}
+        run: |
+          if [ -n "${{ inputs.amazon_url }}" ]; then
+            echo "Processing requested custom URL: ${{ inputs.amazon_url }}"
+            python pipeline.py "${{ inputs.amazon_url }}" --language "${{ inputs.language || 'en' }}"
+          else
+            echo "Running 24/7 Autonomous Engine from database queue..."
+            python autonomous_engine.py --auto-run --batch "${{ inputs.batch_size || '1' }}" --language "${{ inputs.language || 'en' }}"
+          fi
+
+      # ── 6. Commit State Back to Private Repository ──────────────────────────
+      - name: Commit database state back to private repository
+        if: always() && steps.pipeline.outcome != 'skipped'
+        run: |
+          python affiliate/storage_cleaner.py --ci --force-all-temp || true
+          git config user.name  "Affiliate Bot"
+          git config user.email "bot@affiliate-automation"
+          git remote set-url origin https://x-access-token:${{ secrets.GH_PAT }}@github.com/ankit28200/youtube.git
+          git add affiliate/engine_db.sqlite affiliate/queue.txt docs/deals.json deals.json
+          if git diff --staged --quiet; then
+            echo "No state changes to commit."
+          else
+            STATUS_MSG=$(python -c "import sqlite3; c = sqlite3.connect('affiliate/engine_db.sqlite').cursor(); c.execute('SELECT status, youtube_id, error_msg FROM production_logs ORDER BY id DESC LIMIT 1'); row = c.fetchone(); print(f'1 Short uploaded (https://youtube.com/shorts/{row[1]})' if row and row[0]=='SUCCESS' and row[1] else (f'Video generated locally in output/' if row and row[0]=='SUCCESS' else f'Skipped: {row[2][:45] if row and row[2] else \"Upload pending\"}'))" 2>/dev/null || echo "Database & queue updated")
+            git commit -m "🤖 24/7 Engine: ${STATUS_MSG} [skip ci]"
+            git pull --rebase --autostash origin main || true
+            git push origin main
+          fi
